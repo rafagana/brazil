@@ -1,0 +1,4 @@
+# Dockerfile.kafka
+# Optional helper image for Kafka CLI diagnostics. The recommended Kafka runtime
+# for this pilot is docker-compose.kafka.yml.
+FROM apache/kafka:3.9.0
