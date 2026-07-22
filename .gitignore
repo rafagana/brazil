@@ -1,0 +1,15 @@
+# Python virtual environments
+ebpf_venv/
+venv/
+.venv/
+
+# Raw binary data and capture files
+data/
+*.pcap
+*.bin
+*.log
+
+# Caches and local settings
+__pycache__/
+.vscode/
+.bcc/
