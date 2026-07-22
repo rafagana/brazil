@@ -17,7 +17,7 @@ Default traffic filter:
     TCP 3000          Basics Station / WebSocket style deployments
 
 Notes:
-    - Supports one 802.1Q or 802.1AD VLAN tag. Extend VLAN parsing if QinQ is required.
+    - Supports 802.1Q / 802.1AD single VLAN tagging.
     - Default CAPTURE_DIRECTION=ingress is intended for a passive mirror interface.
     - Run as root because TC/eBPF attachment requires elevated privileges.
 """
@@ -41,11 +41,11 @@ from pyroute2 import IPRoute
 # =============================================================================
 VAULT_IP = os.getenv("VAULT_IP", "127.0.0.1")
 VAULT_PORT = int(os.getenv("VAULT_PORT", "9998"))
-CAPTURE_INTERFACE = os.getenv("CAPTURE_INTERFACE", "eth01")
+CAPTURE_INTERFACE = os.getenv("CAPTURE_INTERFACE", "eth0")
 CAPTURE_DIRECTION = os.getenv("CAPTURE_DIRECTION", "ingress").lower()  # ingress, egress, both
 
-SNAPLEN_MAX = int(os.getenv("SNAPLEN_MAX", "1522"))
-INITIAL_SNAPLEN = int(os.getenv("INITIAL_SNAPLEN", "512"))
+SNAPLEN_MAX = int(os.getenv("SNAPLEN_MAX", "9000"))
+INITIAL_SNAPLEN = int(os.getenv("INITIAL_SNAPLEN", "9000"))
 MIN_OVERLOAD_SNAPLEN = int(os.getenv("MIN_OVERLOAD_SNAPLEN", "192"))
 NORMAL_SAMPLE_RATE = int(os.getenv("NORMAL_SAMPLE_RATE", "1"))
 OVERLOAD_SAMPLE_RATE = int(os.getenv("OVERLOAD_SAMPLE_RATE", "5"))
@@ -119,7 +119,7 @@ runtime_state = {
 }
 
 # =============================================================================
-# SIGNAL HANDLING
+# SIGNAL HANDLING & LOGGING
 # =============================================================================
 def log(message: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z"
@@ -180,7 +180,7 @@ static __always_inline int is_chirpstack_traffic(struct __sk_buff *skb) {{
     u64 offset = sizeof(*eth);
     u16 h_proto = eth->h_proto;
 
-    // Supports one 802.1Q or 802.1AD VLAN tag. Extend for QinQ if needed.
+    // Supports one 802.1Q or 802.1AD VLAN tag.
     if (h_proto == bpf_htons(ETH_P_8021Q) || h_proto == bpf_htons(ETH_P_8021AD)) {{
         struct vlan_hdr *vlan = data + offset;
         if ((void *)(vlan + 1) > data_end) return 0;
@@ -225,7 +225,6 @@ static __always_inline int is_chirpstack_traffic(struct __sk_buff *skb) {{
 }}
 
 static __always_inline int submit_packet(struct __sk_buff *skb, u32 direction) {{
-    bpf_trace_printk("eBPF Hook Fired! len=%d\\n", skb->len);
     if (!is_chirpstack_traffic(skb)) return TC_ACT_OK;
 
     u32 sample_rate = read_cfg_or_default(1, {NORMAL_SAMPLE_RATE});
@@ -402,59 +401,105 @@ def network_sender() -> None:
             client_socket = None
 
 
-def adaptive_monitor(bpf: BPF) -> None:
-    """Adjust snaplen / sample rate based on queue pressure with hysteresis."""
+def monitor_stats(bpf: BPF) -> None:
+    """Unified telemetry reporter and adaptive controller from pi_v5."""
+    prev_enq = 0
+    prev_sent = 0
+    prev_bytes = 0
+    prev_pktdrops = 0
+    prev_perflost = 0
+    prev_time = time.monotonic()
+
     while not stop_event.is_set():
         time.sleep(TELEMETRY_INTERVAL_SEC)
-        q_ratio = chunk_queue.qsize() / CHUNK_QUEUE_MAXSIZE
-        mode_before = runtime_state["mode"]
+
+        now = time.monotonic()
+        dt = max(now - prev_time, 0.001)
+        prev_time = now
+
+        with stats_lock:
+            cur_stats = dict(stats)
 
         with bpf_lock:
-            if q_ratio >= QUEUE_CRITICAL_RATIO:
-                runtime_state["mode"] = "critical"
-                runtime_state["stable_intervals"] = 0
-                runtime_state["snaplen"] = MIN_OVERLOAD_SNAPLEN
-                runtime_state["sample_rate"] = CRITICAL_SAMPLE_RATE
-            elif q_ratio >= QUEUE_OVERLOAD_RATIO:
-                runtime_state["mode"] = "overload"
-                runtime_state["stable_intervals"] = 0
-                runtime_state["snaplen"] = MIN_OVERLOAD_SNAPLEN
-                runtime_state["sample_rate"] = OVERLOAD_SAMPLE_RATE
+            mode = runtime_state["mode"]
+            snaplen = runtime_state["snaplen"]
+            sample_rate = runtime_state["sample_rate"]
+
+        # Interval Deltas
+        enq_delta = cur_stats["events_enqueued"] - prev_enq
+        sent_delta = cur_stats["events_sent"] - prev_sent
+        bytes_delta = cur_stats["bytes_sent"] - prev_bytes
+        pktdrops_delta = cur_stats["packet_queue_drops"] - prev_pktdrops
+        perflost_delta = cur_stats["perf_lost"] - prev_perflost
+
+        # Per-second Rates
+        enq_rate = enq_delta / dt
+        sent_rate = sent_delta / dt
+        mbps_sent = (bytes_delta * 8) / dt / 1_000_000
+
+        # Baselines
+        prev_enq = cur_stats["events_enqueued"]
+        prev_sent = cur_stats["events_sent"]
+        prev_bytes = cur_stats["bytes_sent"]
+        prev_pktdrops = cur_stats["packet_queue_drops"]
+        prev_perflost = cur_stats["perf_lost"]
+
+        qsize = chunk_queue.qsize()
+        qratio = qsize / CHUNK_QUEUE_MAXSIZE
+
+        # Standardized Telemetry Line
+        log(
+            "[TELEMETRY] "
+            f"Mode: {mode} | "
+            f"Snaplen: {snaplen} | "
+            f"Sample: 1:{sample_rate} | "
+            f"ChunksQ: {qsize}/{CHUNK_QUEUE_MAXSIZE} | "
+            f"Enq: {cur_stats['events_enqueued']} | "
+            f"Sent: {cur_stats['events_sent']} | "
+            f"Enq/s: {enq_rate:.0f} | "
+            f"Sent/s: {sent_rate:.0f} | "
+            f"Mb/s: {mbps_sent:.1f} | "
+            f"PktDrops: {cur_stats['packet_queue_drops']} (+{pktdrops_delta}) | "
+            f"PerfLost: {cur_stats['perf_lost']} (+{perflost_delta}) | "
+            f"Reconnects: {cur_stats['socket_reconnects']} | "
+            f"SendErr: {cur_stats['send_errors']} | "
+            f"ModeChanges: {cur_stats['adaptive_mode_changes']}"
+        )
+
+        # Adaptive Runtime Control Logic
+        mode_before = mode
+        if qratio >= QUEUE_CRITICAL_RATIO or perflost_delta > 100_000:
+            new_mode = "critical"
+            new_snap = MIN_OVERLOAD_SNAPLEN
+            new_sample = CRITICAL_SAMPLE_RATE
+            stable = 0
+        elif qratio >= QUEUE_OVERLOAD_RATIO or perflost_delta > 0:
+            new_mode = "overload"
+            new_snap = MIN_OVERLOAD_SNAPLEN
+            new_sample = OVERLOAD_SAMPLE_RATE
+            stable = 0
+        else:
+            stable = runtime_state["stable_intervals"] + 1
+            if stable >= STABLE_INTERVALS_TO_RESTORE:
+                new_mode = "normal"
+                new_snap = INITIAL_SNAPLEN
+                new_sample = NORMAL_SAMPLE_RATE
             else:
-                if runtime_state["mode"] != "normal":
-                    runtime_state["stable_intervals"] += 1
-                    if runtime_state["stable_intervals"] >= STABLE_INTERVALS_TO_RESTORE:
-                        runtime_state["mode"] = "normal"
-                        runtime_state["snaplen"] = INITIAL_SNAPLEN
-                        runtime_state["sample_rate"] = NORMAL_SAMPLE_RATE
-                else:
-                    runtime_state["stable_intervals"] = 0
+                new_mode, new_snap, new_sample = mode, snaplen, sample_rate
 
-            bpf["cfg"][ctypes.c_uint32(0)] = ctypes.c_uint32(runtime_state["snaplen"])
-            bpf["cfg"][ctypes.c_uint32(1)] = ctypes.c_uint32(runtime_state["sample_rate"])
+        with bpf_lock:
+            runtime_state["mode"] = new_mode
+            runtime_state["snaplen"] = new_snap
+            runtime_state["sample_rate"] = new_sample
+            runtime_state["stable_intervals"] = stable
 
-        if mode_before != runtime_state["mode"]:
+            bpf["cfg"][ctypes.c_uint32(0)] = ctypes.c_uint32(new_snap)
+            bpf["cfg"][ctypes.c_uint32(1)] = ctypes.c_uint32(new_sample)
+
+        if mode_before != new_mode:
             with stats_lock:
                 stats["adaptive_mode_changes"] += 1
-            log(
-                f"[ADAPT] mode={runtime_state['mode']} q={q_ratio:.2f} "
-                f"snaplen={runtime_state['snaplen']} sample={runtime_state['sample_rate']}"
-            )
-
-
-def stats_reporter() -> None:
-    while not stop_event.is_set():
-        time.sleep(TELEMETRY_INTERVAL_SEC)
-        with stats_lock:
-            snapshot = dict(stats)
-        log(
-            "[STATS] "
-            f"enq={snapshot['events_enqueued']} sent={snapshot['events_sent']} "
-            f"q={chunk_queue.qsize()}/{CHUNK_QUEUE_MAXSIZE} "
-            f"perf_lost={snapshot['perf_lost']} qdrops={snapshot['packet_queue_drops']} "
-            f"send_err={snapshot['send_errors']} send_drop={snapshot['send_dropped_packets']} "
-            f"mode={runtime_state['mode']}"
-        )
+            log(f"[ADAPT] mode={new_mode} snaplen={new_snap} sample_rate=1:{new_sample}")
 
 # =============================================================================
 # TC ATTACHMENT AND MAIN
@@ -500,8 +545,7 @@ def main() -> None:
         bpf["skb_events"].open_perf_buffer(on_packet, lost_cb=on_lost, page_cnt=PERF_PAGE_CNT)
 
         threading.Thread(target=network_sender, daemon=True).start()
-        threading.Thread(target=adaptive_monitor, args=(bpf,), daemon=True).start()
-        threading.Thread(target=stats_reporter, daemon=True).start()
+        threading.Thread(target=monitor_stats, args=(bpf,), daemon=True).start()
 
         while not stop_event.is_set():
             bpf.perf_buffer_poll(timeout=10)
