@@ -19,7 +19,7 @@ import struct
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 try:
@@ -92,7 +92,7 @@ vault_stats = {
 # LOGGING AND SIGNAL HANDLING
 # =============================================================================
 def log(message: str) -> None:
-    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z"
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z"
     print(f"[{ts}] {message}", flush=True)
 
 
@@ -156,7 +156,7 @@ def recv_exact(conn: socket.socket, nbytes: int) -> Optional[bytes]:
 
 
 def timestamp_name(prefix: str, suffix: str) -> str:
-    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     return f"{prefix}_{stamp}_{time.time_ns()}{suffix}"
 
 
@@ -172,6 +172,50 @@ def open_frame_file():
     f = open(path, "wb")
     return f, path, 0
 
+
+# =============================================================================
+# GLOBAL FILE WRITERS (Persist across socket reconnects)
+# =============================================================================
+pcap_lock = threading.Lock()
+global_pcap_file = None
+global_pcap_bytes = 0
+
+frame_lock = threading.Lock()
+global_frame_file = None
+global_frame_bytes = 0
+
+def write_pcap_globally(pkt_hdr: bytes, payload: bytes):
+    global global_pcap_file, global_pcap_bytes
+    with pcap_lock:
+        data_len = len(pkt_hdr) + len(payload)
+        if global_pcap_file is None or (global_pcap_bytes + data_len) >= MAX_FILE_SIZE_BYTES:
+            if global_pcap_file:
+                global_pcap_file.close()
+                with stats_lock:
+                    vault_stats["pcap_rotations"] += 1
+            global_pcap_file, pcap_path, global_pcap_bytes = open_pcap_file()
+            log(f"[PCAP] Opened {pcap_path}")
+        
+        global_pcap_file.write(pkt_hdr)
+        global_pcap_file.write(payload)
+        global_pcap_bytes += data_len
+
+def write_frame_globally(header: bytes, payload: bytes):
+    global global_frame_file, global_frame_bytes
+    with frame_lock:
+        data_len = len(header) + len(payload)
+        if global_frame_file is None or (global_frame_bytes + data_len) >= MAX_FILE_SIZE_BYTES:
+            if global_frame_file:
+                global_frame_file.close()
+                with stats_lock:
+                    vault_stats["frame_file_rotations"] += 1
+            global_frame_file, frame_path, global_frame_bytes = open_frame_file()
+            log(f"[FRAME] Opened {frame_path}")
+        
+        global_frame_file.write(header)
+        global_frame_file.write(payload)
+        global_frame_bytes += data_len
+
 # =============================================================================
 # CLIENT HANDLER
 # =============================================================================
@@ -183,22 +227,7 @@ def handle_client(conn: socket.socket, addr) -> None:
 
     conn.settimeout(1.0)
 
-    pcap_file = None
-    pcap_path = None
-    pcap_bytes_written = 0
-
-    frame_file = None
-    frame_path = None
-    frame_bytes_written = 0
-
     try:
-        if ENABLE_PCAP:
-            pcap_file, pcap_path, pcap_bytes_written = open_pcap_file()
-            log(f"[PCAP] Opened {pcap_path}")
-        if ENABLE_FRAME_ARCHIVE:
-            frame_file, frame_path, frame_bytes_written = open_frame_file()
-            log(f"[FRAME] Opened {frame_path}")
-
         while not stop_event.is_set():
             header = recv_exact(conn, FRAME_HEADER_SIZE)
             if not header:
@@ -228,38 +257,20 @@ def handle_client(conn: socket.socket, addr) -> None:
                 vault_stats["payload_bytes"] += cap_len
                 vault_stats["wire_bytes"] += FRAME_HEADER_SIZE + cap_len
 
-            if ENABLE_PCAP and pcap_file:
+            if ENABLE_PCAP:
                 try:
                     sec = wall_ts_ns // 1_000_000_000
                     usec = (wall_ts_ns % 1_000_000_000) // 1_000
                     pkt_hdr = struct.pack("<IIII", sec, usec, cap_len, orig_len)
-                    pcap_file.write(pkt_hdr)
-                    pcap_file.write(payload)
-                    pcap_bytes_written += 16 + cap_len
-
-                    if pcap_bytes_written >= MAX_FILE_SIZE_BYTES:
-                        pcap_file.close()
-                        with stats_lock:
-                            vault_stats["pcap_rotations"] += 1
-                        pcap_file, pcap_path, pcap_bytes_written = open_pcap_file()
-                        log(f"[PCAP] Rotated to {pcap_path}")
+                    write_pcap_globally(pkt_hdr, payload)
                 except OSError as exc:
                     with stats_lock:
                         vault_stats["pcap_write_errors"] += 1
                     log(f"[PCAP] Write error: {exc}")
 
-            if ENABLE_FRAME_ARCHIVE and frame_file:
+            if ENABLE_FRAME_ARCHIVE:
                 try:
-                    frame_file.write(header)
-                    frame_file.write(payload)
-                    frame_bytes_written += FRAME_HEADER_SIZE + cap_len
-
-                    if frame_bytes_written >= MAX_FILE_SIZE_BYTES:
-                        frame_file.close()
-                        with stats_lock:
-                            vault_stats["frame_file_rotations"] += 1
-                        frame_file, frame_path, frame_bytes_written = open_frame_file()
-                        log(f"[FRAME] Rotated to {frame_path}")
+                    write_frame_globally(header, payload)
                 except OSError as exc:
                     with stats_lock:
                         vault_stats["frame_write_errors"] += 1
@@ -294,10 +305,6 @@ def handle_client(conn: socket.socket, addr) -> None:
 
     finally:
         try:
-            if pcap_file:
-                pcap_file.close()
-            if frame_file:
-                frame_file.close()
             conn.close()
         finally:
             with stats_lock:
