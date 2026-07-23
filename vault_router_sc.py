@@ -315,19 +315,53 @@ def handle_client(conn: socket.socket, addr) -> None:
 # SERVICE THREADS AND MAIN
 # =============================================================================
 def stats_reporter() -> None:
+    last_stats_time = time.time()
+    last_frames = 0
+    last_payload_bytes = 0
+    last_wire_bytes = 0
+    last_seq_gaps = 0
+    last_malformed = 0
+
     while not stop_event.is_set():
         time.sleep(STATS_INTERVAL_SECONDS)
+        now_mono = time.time()
+        dt = max(now_mono - last_stats_time, 0.001)
+
         with stats_lock:
             snapshot = dict(vault_stats)
-        log(
-            "[STATS] "
-            f"frames={snapshot['frames_received']} active={snapshot['active_connections']} "
-            f"gaps={snapshot['sequence_gaps']} dup_reorder={snapshot['duplicates_or_reordered']} "
-            f"malformed={snapshot['malformed_frames']} "
-            f"pcap_rot={snapshot['pcap_rotations']} frame_rot={snapshot['frame_file_rotations']} "
-            f"kafka_enq={snapshot['kafka_enqueued']} kafka_deliv={snapshot['kafka_delivered']} "
-            f"kafka_err={snapshot['kafka_errors']}"
+
+        delta_frames = snapshot["frames_received"] - last_frames
+        delta_payload_bytes = snapshot["payload_bytes"] - last_payload_bytes
+        delta_wire_bytes = snapshot["wire_bytes"] - last_wire_bytes
+        delta_gaps = snapshot["sequence_gaps"] - last_seq_gaps
+        delta_malformed = snapshot["malformed_frames"] - last_malformed
+
+        fps = int(round(delta_frames / dt))
+        payload_mbs = (delta_payload_bytes * 8.0) / (dt * 1e6)
+        wire_mbs = (delta_wire_bytes * 8.0) / (dt * 1e6)
+
+        last_stats_time = now_mono
+        last_frames = snapshot["frames_received"]
+        last_payload_bytes = snapshot["payload_bytes"]
+        last_wire_bytes = snapshot["wire_bytes"]
+        last_seq_gaps = snapshot["sequence_gaps"]
+        last_malformed = snapshot["malformed_frames"]
+
+        now_wall = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+        log_line = (
+            f"[{now_wall}] [STATS] "
+            f"Conn={snapshot['connections']} Active={snapshot['active_connections']} "
+            f"Frames={snapshot['frames_received']} FPS={fps} "
+            f"PayloadMb/s={payload_mbs:.1f} WireMb/s={wire_mbs:.1f} "
+            f"SeqGaps={snapshot['sequence_gaps']} (+{delta_gaps}) "
+            f"Dup/Reord={snapshot['duplicates_or_reordered']} "
+            f"Malformed={snapshot['malformed_frames']} (+{delta_malformed}) "
+            f"FrameRot={snapshot['frame_file_rotations']} PcapRot={snapshot['pcap_rotations']} "
+            f"KafkaEnq={snapshot['kafka_enqueued']} KafkaDeliv={snapshot['kafka_delivered']} "
+            f"KafkaErr={snapshot['kafka_errors']}"
         )
+        print(log_line, flush=True)
  
 
 def init_kafka() -> Optional[Producer]:
